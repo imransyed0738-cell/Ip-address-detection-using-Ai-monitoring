@@ -146,16 +146,40 @@ function AuthPage() {
   }, []);
 
   async function continueAfterPassword() {
-    const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
-    if (aal?.nextLevel === "aal2" && aal.nextLevel !== aal.currentLevel) {
-      const { data: factors } = await supabase.auth.mfa.listFactors();
-      const verified = factors?.totp?.find((f) => f.status === "verified");
-      if (verified) {
-        setFactorId(verified.id);
-        setMode("mfa");
-        return;
+    // Wait up to 2s for the session to be persisted (brokeredPreviewStorage is async).
+    let sessionReady = false;
+    for (let i = 0; i < 8; i++) {
+      const { data: s } = await supabase.auth.getSession();
+      if (s.session?.access_token) {
+        sessionReady = true;
+        break;
       }
+      await new Promise((r) => setTimeout(r, 250));
     }
+
+    if (!sessionReady) {
+      // Session not available — sign-in still may have worked, try navigating anyway
+      await afterSignIn();
+      navigate({ to: "/user/dashboard", replace: true });
+      return;
+    }
+
+    // Check MFA requirement — wrapped in try/catch so a failure never blocks navigation
+    try {
+      const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
+      if (aal?.nextLevel === "aal2" && aal.nextLevel !== aal.currentLevel) {
+        const { data: factors } = await supabase.auth.mfa.listFactors();
+        const verified = factors?.totp?.find((f) => f.status === "verified");
+        if (verified) {
+          setFactorId(verified.id);
+          setMode("mfa");
+          return;
+        }
+      }
+    } catch {
+      // MFA check failure must never block navigation — proceed to dashboard
+    }
+
     await afterSignIn();
     navigate({ to: "/user/dashboard", replace: true });
   }

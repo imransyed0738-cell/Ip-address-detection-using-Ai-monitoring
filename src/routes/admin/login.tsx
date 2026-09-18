@@ -65,7 +65,9 @@ function AdminLogin() {
       const res = await checkAdmin();
       if (!res.admin) {
         await supabase.auth.signOut();
-        toast.error("This account is not an administrator.");
+        toast.error("Access denied", {
+          description: "This account does not have administrator privileges.",
+        });
         return;
       }
       window.localStorage.removeItem(LOCK_KEY);
@@ -76,8 +78,14 @@ function AdminLogin() {
       }
       navigate({ to: "/admin/dashboard", replace: true });
     } catch (error) {
-      toast.error("Admin sign-in could not be completed", {
-        description: error instanceof Error ? error.message : "Please try again.",
+      // Sign out so the user is not stuck in a half-authenticated state
+      try { await supabase.auth.signOut(); } catch { /* ignore */ }
+      const message = error instanceof Error ? error.message : "Please try again.";
+      const isAuth = message.toLowerCase().includes("unauthorized") || message.toLowerCase().includes("session");
+      toast.error(isAuth ? "Sign-in session lost" : "Admin sign-in could not be completed", {
+        description: isAuth
+          ? "Your session expired during sign-in. Please enter your credentials again."
+          : message,
       });
     }
   }
@@ -100,6 +108,24 @@ function AdminLogin() {
           : `Sign-in failed. ${MAX_ATTEMPTS - state.fails} attempt(s) remaining.`,
         { description: error.message },
       );
+      return;
+    }
+
+    // Wait for the session to be persisted (brokeredPreviewStorage is async).
+    // Poll up to 2 seconds for the access token.
+    let sessionToken: string | undefined;
+    for (let i = 0; i < 8; i++) {
+      const { data: s } = await supabase.auth.getSession();
+      if (s.session?.access_token) {
+        sessionToken = s.session.access_token;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+
+    if (!sessionToken) {
+      setBusy(false);
+      toast.error("Session could not be established. Please try again.");
       return;
     }
 
