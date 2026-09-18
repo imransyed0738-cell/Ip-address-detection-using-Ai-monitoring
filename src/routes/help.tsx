@@ -146,7 +146,7 @@ function Help() {
                 </Button>
                 {emailResult === "sent" && (
                   <p className="text-xs text-muted-foreground">
-                    Your message was sent to {SUPPORT.email}.
+                    Your message has been sent to the help line. You are registered for the support help line.
                   </p>
                 )}
                 {emailResult === "draft" && (
