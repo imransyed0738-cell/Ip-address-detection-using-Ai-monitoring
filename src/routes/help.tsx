@@ -1,6 +1,6 @@
-import { Link, createFileRoute } from "@tanstack/react-router";
+import { Link, createFileRoute, useRouter } from "@tanstack/react-router";
 import { useMutation } from "@tanstack/react-query";
-import { LifeBuoy, Mail, Phone, ShieldAlert } from "lucide-react";
+import { ArrowLeft, LifeBuoy, Mail, Phone, ShieldAlert } from "lucide-react";
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -28,6 +28,7 @@ export const Route = createFileRoute("/help")({
 });
 
 function Help() {
+  const router = useRouter();
   const phoneConfigured = SUPPORT.phone !== "";
   const emailConfigured = SUPPORT.email !== "";
   const [emailFormOpen, setEmailFormOpen] = useState(false);
@@ -66,9 +67,20 @@ function Help() {
   return (
     <div className="min-h-screen bg-surface px-4 py-12">
       <div className="mx-auto max-w-2xl">
-        <Link to="/" className="text-sm text-accent underline-offset-4 hover:underline">
-          ← Back
-        </Link>
+        <button
+          type="button"
+          onClick={() => {
+            if (window.history.length > 1) {
+              router.history.back();
+            } else {
+              void router.navigate({ to: "/user/dashboard" });
+            }
+          }}
+          className="flex items-center gap-1.5 text-sm text-accent underline-offset-4 hover:underline"
+        >
+          <ArrowLeft className="size-4" />
+          Back to Dashboard
+        </button>
         <div className="panel mt-4 p-8">
           <LifeBuoy className="size-6 text-accent" />
           <h1 className="mt-4 text-2xl font-semibold">24/7 Security Support</h1>
