@@ -29,3 +29,4 @@ pnpm-debug.log*
 .DS_Store
 .otp-storage.json
 .attendance_store.json
+.vercel/

@@ -1,7 +1,7 @@
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { AlertTriangle, ClipboardCheck, ClipboardList, LogOut, MapPin, ShieldAlert, Users } from "lucide-react";
+import { AlertTriangle, ClipboardCheck, ClipboardList, FileSpreadsheet, LogOut, MapPin, ShieldAlert, Users } from "lucide-react";
 import type { ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -11,6 +11,7 @@ import { cn } from "@/lib/utils";
 
 const NAV = [
   { to: "/admin/dashboard", label: "Overview", icon: ShieldAlert },
+  { to: "/admin/reports", label: "Reports & Audit", icon: FileSpreadsheet },
   { to: "/admin/users", label: "Users", icon: Users },
   { to: "/admin/attendance", label: "Attendance", icon: ClipboardCheck },
   { to: "/admin/location", label: "Locations", icon: MapPin },

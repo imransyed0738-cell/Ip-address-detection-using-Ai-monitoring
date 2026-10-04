@@ -1,11 +1,15 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
+import { FileSpreadsheet, FileText } from "lucide-react";
 import { useState } from "react";
+import { toast } from "sonner";
 
 import { AdminShell, RiskBadge } from "@/components/AdminShell";
+import { Button } from "@/components/ui/button";
 import { adminSecurityEvents } from "@/lib/admin.functions";
 import { useAdminRealtime } from "@/lib/admin-realtime";
+import { exportSecurityAuditPdf, exportToCsv, type SecurityEventReportItem } from "@/lib/report-export";
 import { formatWhen, prettyEvent } from "@/lib/user-data";
 
 export const Route = createFileRoute("/_authenticated/admin/events")({
@@ -30,21 +34,85 @@ function AdminEvents() {
     queryFn: () => load({ data: { highRiskOnly } }),
   });
 
+  const exportItems: SecurityEventReportItem[] = (data ?? []).map((e: any) => ({
+    id: e.id,
+    created_at: e.created_at,
+    event_type: prettyEvent(e.event_type),
+    user_email: e.user?.email,
+    user_name: e.user?.full_name,
+    ip_address: e.ip_address,
+    region: e.region,
+    device: e.device_summary ?? (e.device ? `${e.device.browser || ""} ${e.device.os || ""}`.trim() : "—"),
+    risk_score: e.risk_score ?? 0,
+    risk_level: e.risk_level ?? "LOW",
+    status: e.status ?? "Processed",
+  }));
+
+  const handleExportCsv = () => {
+    if (!exportItems.length) {
+      toast.warning("No security events to export");
+      return;
+    }
+    const stamp = new Date().toISOString().slice(0, 10);
+    const headers = ["Timestamp", "Event Type", "User Name", "Email", "IP Address", "Region", "Device", "Risk Score", "Risk Level", "Status"];
+    const rows = exportItems.map((s) => [
+      s.created_at,
+      s.event_type,
+      s.user_name || "—",
+      s.user_email || "—",
+      s.ip_address || "—",
+      s.region || "—",
+      s.device || "—",
+      s.risk_score,
+      s.risk_level,
+      s.status,
+    ]);
+    exportToCsv(`Sentinel_Security_Events_${stamp}`, headers, rows);
+    toast.success("Security events CSV exported successfully");
+  };
+
+  const handleExportPdf = () => {
+    if (!exportItems.length) {
+      toast.warning("No security events to export");
+      return;
+    }
+    exportSecurityAuditPdf(exportItems, {
+      dateRange: highRiskOnly ? "High-Risk Events Only" : "All Security Events",
+      generatedBy: "Sentinel Admin",
+    });
+    toast.success("Security events PDF report generated successfully");
+  };
+
   return (
     <AdminShell>
-      <div className="flex flex-wrap items-center gap-3">
-        <h1 className="text-xl font-semibold">Security events</h1>
-        <span
-          className={
-            realtimeStatus === "SUBSCRIBED" ? "text-xs text-success" : "text-xs text-warning"
-          }
-        >
-          {realtimeStatus === "SUBSCRIBED" ? "Live" : `Realtime ${realtimeStatus.toLowerCase()}`}
-        </span>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-3">
+            <h1 className="text-xl font-semibold">Security events</h1>
+            <span
+              className={
+                realtimeStatus === "SUBSCRIBED" ? "text-xs text-success" : "text-xs text-warning"
+              }
+            >
+              {realtimeStatus === "SUBSCRIBED" ? "Live" : `Realtime ${realtimeStatus.toLowerCase()}`}
+            </span>
+          </div>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Live authentication and account-security events. Risk scores are signals for human review.
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Button variant="outline" size="sm" onClick={handleExportCsv} className="gap-1.5 text-xs shadow-2xs">
+            <FileSpreadsheet className="size-3.5 text-emerald-600" />
+            Export CSV
+          </Button>
+          <Button size="sm" onClick={handleExportPdf} className="gap-1.5 bg-navy text-navy-foreground text-xs shadow-2xs hover:bg-navy/90">
+            <FileText className="size-3.5 text-blue-400" />
+            Export PDF Report
+          </Button>
+        </div>
       </div>
-      <p className="mt-1 text-sm text-muted-foreground">
-        Live authentication and account-security events. Risk scores are signals for human review.
-      </p>
 
       <label className="mt-4 inline-flex items-center gap-2 text-sm">
         <input

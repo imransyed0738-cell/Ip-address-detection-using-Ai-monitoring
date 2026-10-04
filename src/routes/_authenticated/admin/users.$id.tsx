@@ -9,7 +9,7 @@ import { AdminShell, RiskBadge } from "@/components/AdminShell";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { adminUserAction, adminUserDetail } from "@/lib/admin.functions";
-import { getAttendanceLogs } from "@/lib/security.functions";
+import { getAdminUserAttendanceAlerts, getAttendanceLogs } from "@/lib/security.functions";
 import { formatWhen, prettyEvent } from "@/lib/user-data";
 
 export const Route = createFileRoute("/_authenticated/admin/users/$id")({
@@ -52,9 +52,17 @@ function Investigation() {
     queryFn: () => detail({ data: { userId: id } }),
   });
 
+  const getAlertsFn = useServerFn(getAdminUserAttendanceAlerts);
+
   const attendanceQuery = useQuery({
     queryKey: ["admin", "userAttendance", id],
     queryFn: () => getLogsFn({ data: { limit: 100 } }),
+  });
+
+  const userAttendanceAlertsQuery = useQuery({
+    queryKey: ["admin", "userAttendanceAlerts", id],
+    queryFn: () => getAlertsFn({ data: { userId: id } }),
+    refetchInterval: 15_000,
   });
 
   const action = useMutation({
@@ -441,6 +449,81 @@ function Investigation() {
                 </tbody>
               </table>
             </div>
+          </Panel>
+
+          {/* Attendance Notification History */}
+          <Panel title="Attendance Notification History">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+              <p className="text-xs text-muted-foreground">
+                All attendance alerts generated for this user — when records were{" "}
+                <strong>marked</strong>, <strong>modified</strong>, or <strong>deleted</strong>.
+              </p>
+              <span className="rounded-full bg-primary/10 px-2.5 py-0.5 text-xs font-semibold text-primary">
+                {(userAttendanceAlertsQuery.data ?? []).length} alerts
+              </span>
+            </div>
+
+            {userAttendanceAlertsQuery.isLoading ? (
+              <div className="py-6 text-center text-xs text-muted-foreground">
+                Loading notification history…
+              </div>
+            ) : (userAttendanceAlertsQuery.data ?? []).length === 0 ? (
+              <div className="rounded-lg border border-dashed border-border py-8 text-center text-xs text-muted-foreground">
+                <ClipboardCheck className="mx-auto mb-2 size-5 opacity-40" />
+                No attendance notifications recorded for this user yet.
+              </div>
+            ) : (
+              <div className="divide-y divide-border rounded-lg border border-border overflow-hidden">
+                {(userAttendanceAlertsQuery.data ?? []).map((alert) => {
+                  const isDeleted = alert.title.toLowerCase().includes("deleted");
+                  const isModified = alert.title.toLowerCase().includes("modified");
+
+                  const actionLabel = isDeleted ? "🗑️ Deleted" : isModified ? "✏️ Modified" : "📋 Marked";
+                  const actionBadgeClass = isDeleted
+                    ? "bg-destructive/10 text-destructive border border-destructive/20"
+                    : isModified
+                      ? "bg-warning/15 text-warning-foreground border border-warning/30"
+                      : "bg-success/10 text-success border border-success/20";
+
+                  const severityBadgeClass =
+                    alert.severity === "HIGH" || alert.severity === "CRITICAL"
+                      ? "bg-destructive/10 text-destructive"
+                      : alert.severity === "MEDIUM"
+                        ? "bg-warning/15 text-warning-foreground"
+                        : "bg-success/10 text-success";
+
+                  const rowBg = isDeleted
+                    ? "bg-destructive/5"
+                    : isModified
+                      ? "bg-warning/5"
+                      : "";
+
+                  return (
+                    <div key={alert.id} className={`flex flex-wrap items-start gap-3 px-3 py-3 text-sm ${rowBg}`}>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold ${actionBadgeClass}`}>
+                            {actionLabel}
+                          </span>
+                          <span className="font-medium text-xs truncate">{alert.title}</span>
+                          <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${severityBadgeClass}`}>
+                            {alert.severity}
+                          </span>
+                        </div>
+                        {alert.description && (
+                          <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
+                            {alert.description}
+                          </p>
+                        )}
+                      </div>
+                      <time className="shrink-0 whitespace-nowrap text-[11px] text-muted-foreground">
+                        {formatWhen(alert.created_at)}
+                      </time>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </Panel>
         </div>
       )}

@@ -140,6 +140,24 @@ async function resolvePublicIpAndGeo(providedIp?: string | null): Promise<{ ip: 
         }
       } catch {}
     }
+
+    if (!label) {
+      try {
+        const ipApiRes = await fetch(`http://ip-api.com/json/${encodeURIComponent(ip)}`, {
+          headers: { accept: "application/json" },
+          signal: AbortSignal.timeout(4000),
+        });
+        const j3 = (await ipApiRes.json()) as any;
+        if (j3 && j3.status === "success") {
+          city = j3.city ?? null;
+          country = j3.country ?? null;
+          const parts = [j3.city, j3.regionName, j3.country].filter(Boolean);
+          label = parts.length ? parts.join(", ") : null;
+          lat = typeof j3.lat === "number" ? j3.lat : null;
+          lng = typeof j3.lon === "number" ? j3.lon : null;
+        }
+      } catch {}
+    }
   }
 
   return { ip, geo: { label, lat, lng, city, country } };
@@ -353,7 +371,12 @@ interface StoredOtpRecord {
 
 declare global {
   var __sentinel_otp_memory_cache: Map<string, StoredOtpRecord> | undefined;
+  var __sentinel_login_email_store: Map<string, number> | undefined;
 }
+
+const lastLoginEmailStore: Map<string, number> =
+  globalThis.__sentinel_login_email_store ??
+  (globalThis.__sentinel_login_email_store = new Map<string, number>());
 
 const memoryOtpCache: Map<string, StoredOtpRecord> =
   globalThis.__sentinel_otp_memory_cache ??
@@ -1099,7 +1122,8 @@ export const recordSecurityEvent = createServerFn({ method: "POST" })
     // Raise an alert if table exists
     if (score >= 30 || !["LOGIN_SUCCESS", "LOGOUT"].includes(data.eventType)) {
       try {
-        await supabase.from("security_alerts").insert({
+        const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+        await supabaseAdmin.from("security_alerts").insert({
           user_id: userId,
           title: titleFor(data.eventType, level),
           description: `${data.eventType.replaceAll("_", " ").toLowerCase()} • IP ${ip}${
@@ -1110,6 +1134,81 @@ export const recordSecurityEvent = createServerFn({ method: "POST" })
           event_id: insertedId,
         });
       } catch {}
+    }
+
+    // Dispatch Login Email Notification whenever user signs in
+    if (data.eventType === "LOGIN_SUCCESS") {
+      const lastSent = lastLoginEmailStore.get(userId) || 0;
+      const isExplicitSignIn = data.note?.toLowerCase().includes("sign-in") || data.note?.toLowerCase().includes("login");
+      const shouldSend = (Date.now() - lastSent > 15_000) || isExplicitSignIn;
+
+      if (shouldSend) {
+        lastLoginEmailStore.set(userId, Date.now());
+        try {
+          const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+          let targetEmail = "";
+          let fullName = "";
+
+          const { data: userRecord } = await supabaseAdmin.auth.admin.getUserById(userId);
+          if (userRecord?.user?.email) {
+            targetEmail = userRecord.user.email;
+            fullName = userRecord.user.user_metadata?.["full_name"] || "";
+          }
+
+          if (!targetEmail) {
+            const { data: prof } = await supabaseAdmin.from("profiles").select("email, full_name").eq("id", userId).maybeSingle();
+            if (prof?.email) {
+              targetEmail = prof.email;
+              fullName = fullName || prof.full_name || "";
+            }
+          }
+
+          if (targetEmail) {
+            const { sendNotificationEmail } = await import("@/lib/mailer.server");
+            const timeStr = new Date().toLocaleString("en-US", {
+              dateStyle: "full",
+              timeStyle: "medium",
+            });
+            const locationStr = geo.label || [geo.city, geo.country].filter(Boolean).join(", ") || "Approximate IP location";
+            const deviceStr = `${data.device.deviceName || "Device"} (${data.device.browser || "Browser"}, ${data.device.os || "OS"})`;
+            const riskColor = level === "LOW" ? "#16a34a" : level === "MEDIUM" ? "#d97706" : "#dc2626";
+
+            void sendNotificationEmail({
+              to: targetEmail,
+              subject: `[Sentinel] New Login Notification — ${locationStr}`,
+              text: `Hello ${fullName || "there"},\n\nA successful sign-in to your Sentinel Security account was detected.\n\nTime: ${timeStr}\nIP Address: ${ip}\nLocation: ${locationStr}\nDevice: ${deviceStr}\nRisk Assessment: ${level} (${score}/100)\n\nIf this was you, you can safely disregard this notification. If you did not log in, lock your account or change your password immediately.\n\nSentinel Security Team`,
+              html: `
+                <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 540px; margin: 0 auto; padding: 24px; border: 1px solid #e5e7eb; border-radius: 8px; background: #ffffff;">
+                  <div style="display: flex; align-items: center; margin-bottom: 18px;">
+                    <div style="font-size: 18px; font-weight: 700; color: #0f172a;">🛡️ Sentinel Secure Banking</div>
+                  </div>
+                  <h2 style="color: #111827; margin-top: 0; font-size: 18px;">New Account Sign-In Detected</h2>
+                  <p style="color: #4b5563; font-size: 14px; line-height: 1.5;">Hello <strong>${fullName || "Account Holder"}</strong>,</p>
+                  <p style="color: #4b5563; font-size: 14px; line-height: 1.5;">A new sign-in was detected on your Sentinel Security account (<strong>${targetEmail}</strong>).</p>
+                  
+                  <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 18px; margin: 20px 0;">
+                    <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; color: #64748b; letter-spacing: 0.05em; margin-bottom: 12px;">Sign-In Security Overview</div>
+                    <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                      <tr><td style="color: #64748b; padding: 5px 0; width: 35%;">Date & Time</td><td style="color: #0f172a; font-weight: 600;">${timeStr}</td></tr>
+                      <tr><td style="color: #64748b; padding: 5px 0;">Observed IP</td><td style="color: #0f172a; font-family: monospace; font-weight: 600;">${ip}</td></tr>
+                      <tr><td style="color: #64748b; padding: 5px 0;">Geo Location</td><td style="color: #0f172a; font-weight: 600;">${locationStr}</td></tr>
+                      ${geo.lat && geo.lng ? `<tr><td style="color: #64748b; padding: 5px 0;">Coordinates</td><td style="color: #0f172a; font-family: monospace; font-size: 12px;">${Number(geo.lat).toFixed(4)}°, ${Number(geo.lng).toFixed(4)}°</td></tr>` : ""}
+                      <tr><td style="color: #64748b; padding: 5px 0;">Device & Browser</td><td style="color: #0f172a;">${deviceStr}</td></tr>
+                      <tr><td style="color: #64748b; padding: 5px 0;">Risk Level</td><td style="color: ${riskColor}; font-weight: 700;">${level} (${score}/100)</td></tr>
+                    </table>
+                  </div>
+
+                  <p style="color: #64748b; font-size: 13px; line-height: 1.5;">If this was you, you can safely ignore this email. If you did not sign in, lock your account immediately from your Security Dashboard or contact support.</p>
+                  <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 20px 0;" />
+                  <p style="color: #94a3b8; font-size: 12px; margin-bottom: 0;">Sentinel Security Real-Time Notification System</p>
+                </div>
+              `,
+            }).catch((err) => console.warn("[Security] Login email send notice:", err));
+          }
+        } catch (mailErr) {
+          console.warn("[Security] Login email notification error:", mailErr);
+        }
+      }
     }
 
     try {
@@ -1173,7 +1272,15 @@ function titleFor(eventType: string, level: string) {
 /** Returns the server-observed IP and approximate region of the caller. */
 export const getConnectionInfo = createServerFn({ method: "GET" }).handler(async () => {
   const resolved = await resolvePublicIpAndGeo(clientIp());
-  return { ip: resolved.ip, location: resolved.geo.label, userAgent: clientUserAgent() };
+  return {
+    ip: resolved.ip,
+    location: resolved.geo.label,
+    lat: resolved.geo.lat,
+    lng: resolved.geo.lng,
+    city: resolved.geo.city,
+    country: resolved.geo.country,
+    userAgent: clientUserAgent(),
+  };
 });
 
 /** Audits an attendance edit/removal and alerts the acting user plus all administrators. */
@@ -1446,15 +1553,56 @@ export const getMyProfile = createServerFn({ method: "GET" })
       .eq("id", userId)
       .maybeSingle();
 
-    if (profile) return profile;
+    const resolved = await resolvePublicIpAndGeo(clientIp());
+
+    if (profile) {
+      // Ensure geo coordinates & location are populated if missing
+      if (profile.last_lat == null || !profile.last_location_label) {
+        if (resolved.geo.label || resolved.geo.lat != null) {
+          profile.last_lat = profile.last_lat ?? resolved.geo.lat;
+          profile.last_lng = profile.last_lng ?? resolved.geo.lng;
+          profile.last_location_label = profile.last_location_label ?? resolved.geo.label;
+          profile.city = profile.city ?? (resolved.geo.city ?? null);
+          profile.country = profile.country ?? (resolved.geo.country ?? null);
+          profile.last_location_at = profile.last_location_at ?? new Date().toISOString();
+
+          try {
+            await supabaseAdmin.from("profiles").update({
+              last_lat: profile.last_lat,
+              last_lng: profile.last_lng,
+              last_location_label: profile.last_location_label,
+              city: profile.city,
+              country: profile.country,
+              last_location_at: profile.last_location_at,
+            }).eq("id", userId);
+          } catch {}
+        }
+      }
+      return profile;
+    }
 
     const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(userId);
-    return {
+    const newProfile = {
       id: userId,
       email: authUser?.user?.email ?? null,
       full_name: authUser?.user?.user_metadata?.["full_name"] ?? null,
-      location_consent: false,
+      location_consent: true,
+      last_lat: resolved.geo.lat,
+      last_lng: resolved.geo.lng,
+      last_location_label: resolved.geo.label,
+      city: resolved.geo.city ?? null,
+      country: resolved.geo.country ?? null,
+      last_location_at: new Date().toISOString(),
+      account_locked: false,
+      flagged_for_review: false,
+      require_password_reset: false,
     };
+
+    try {
+      await supabaseAdmin.from("profiles").upsert(newProfile, { onConflict: "id" });
+    } catch {}
+
+    return newProfile;
   });
 
 export const getMySecurityEvents = createServerFn({ method: "POST" })
@@ -1501,6 +1649,17 @@ export const getMyAlerts = createServerFn({ method: "GET" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const userId = context.userId;
 
+    const allAlerts: Array<{
+      id: string;
+      title: string;
+      description: string | null;
+      severity: string;
+      category: string;
+      read: boolean;
+      created_at: string;
+    }> = [];
+
+    // 1. Fetch alerts directly from Supabase security_alerts
     try {
       const { data: alerts } = await supabaseAdmin
         .from("security_alerts")
@@ -1509,7 +1668,298 @@ export const getMyAlerts = createServerFn({ method: "GET" })
         .order("created_at", { ascending: false })
         .limit(100);
 
-      return alerts ?? [];
+      if (alerts && alerts.length > 0) {
+        allAlerts.push(...alerts);
+      }
+    } catch (err) {
+      console.warn("[getMyAlerts] Error reading security_alerts:", err);
+    }
+
+    // 2. Aggregate attendance notification history from attendance_logs & local attendance store
+    try {
+      const attRecords: Array<{
+        id: string;
+        name: string;
+        rollNumber: string;
+        date: string;
+        status: string;
+        note?: string;
+        ipAddress?: string;
+        createdAt?: string;
+        updatedAt?: string;
+      }> = [];
+
+      try {
+        const { data: dbLogs } = await supabaseAdmin
+          .from("attendance_logs")
+          .select("*")
+          .eq("user_id", userId)
+          .order("created_at", { ascending: false });
+
+        if (dbLogs && dbLogs.length > 0) {
+          for (const row of dbLogs) {
+            attRecords.push({
+              id: row.id,
+              name: row.name,
+              rollNumber: row.roll_number,
+              date: row.date,
+              status: row.status,
+              note: row.note ?? "",
+              ipAddress: row.ip_address ?? "Unavailable",
+              createdAt: row.created_at,
+              updatedAt: row.updated_at,
+            });
+          }
+        }
+      } catch {}
+
+      // Fallback/merge from local store
+      try {
+        const localLogs = await readLocalAttendanceStore(userId);
+        for (const loc of localLogs) {
+          const exists = attRecords.some(
+            (r) => r.id === loc.id || (r.date === loc.date && r.rollNumber === loc.rollNumber),
+          );
+          if (!exists) {
+            attRecords.push({
+              id: loc.id,
+              name: loc.name,
+              rollNumber: loc.rollNumber,
+              date: loc.date,
+              status: loc.status,
+              note: loc.note,
+              ipAddress: loc.ipAddress,
+              createdAt: loc.createdAt,
+              updatedAt: loc.updatedAt,
+            });
+          }
+        }
+      } catch {}
+
+      // For every attendance record, verify if an alert is already in allAlerts
+      for (const rec of attRecords) {
+        const hasAlert = allAlerts.some(
+          (a) =>
+            a.category === "attendance" &&
+            (a.title.includes(rec.date) || (a.description && a.description.includes(rec.date))),
+        );
+
+        if (!hasAlert) {
+          const noteText = rec.note ? ` Note: ${rec.note}.` : "";
+          const alertId = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `att-${Date.now()}`;
+          const isModified = rec.updatedAt && rec.createdAt && rec.updatedAt !== rec.createdAt;
+          const newAlert = {
+            id: alertId,
+            title: isModified
+              ? `Attendance Record Modified: ${rec.status} (${rec.date})`
+              : `Attendance Marked: ${rec.status} (${rec.date})`,
+            description: `Attendance record for ${rec.name} (Roll/ID: ${rec.rollNumber}) on ${rec.date} recorded as ${rec.status}.${noteText} • Observed IP: ${rec.ipAddress || "Unknown"}`,
+            severity: rec.status === "Absent" ? "MEDIUM" : "LOW",
+            category: "attendance",
+            read: false,
+            created_at: rec.createdAt || rec.updatedAt || new Date().toISOString(),
+          };
+
+          allAlerts.push(newAlert);
+
+          // Persist to security_alerts in Supabase if possible
+          try {
+            await supabaseAdmin.from("security_alerts").insert({
+              id: newAlert.id,
+              user_id: userId,
+              title: newAlert.title,
+              description: newAlert.description,
+              severity: newAlert.severity,
+              category: newAlert.category,
+              read: newAlert.read,
+              created_at: newAlert.created_at,
+            });
+          } catch {}
+        }
+      }
+    } catch (attErr) {
+      console.warn("[getMyAlerts] Error processing attendance alerts:", attErr);
+    }
+
+    // 3. Aggregate security events into notification history
+    try {
+      const { data: secEvents } = await supabaseAdmin
+        .from("security_events")
+        .select("id, event_type, ip_address, device_type, browser, os, location_label, risk_level, created_at")
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false })
+        .limit(10);
+
+      if (secEvents && secEvents.length > 0) {
+        for (const ev of secEvents) {
+          const hasSecAlert = allAlerts.some(
+            (a) =>
+              a.category === "security" &&
+              (a.created_at === ev.created_at || (a.description && a.description.includes(ev.created_at))),
+          );
+
+          if (!hasSecAlert) {
+            const evTitle =
+              ev.event_type === "LOGIN_SUCCESS"
+                ? "Login Session Authenticated"
+                : ev.event_type.replaceAll("_", " ");
+            const locText = ev.location_label ? ` • Location: ${ev.location_label}` : "";
+            const newAlert = {
+              id: typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `sec-${Date.now()}`,
+              title: evTitle,
+              description: `Sign-in authenticated via ${ev.browser ?? "Browser"} (${ev.os ?? "Device"}) • IP: ${ev.ip_address ?? "Unknown"}${locText}`,
+              severity: ev.risk_level ?? "LOW",
+              category: "security",
+              read: true,
+              created_at: ev.created_at,
+            };
+
+            allAlerts.push(newAlert);
+          }
+        }
+      }
+    } catch (secErr) {
+      console.warn("[getMyAlerts] Error processing security events:", secErr);
+    }
+
+    // 4. Default baseline notifications if user has zero notifications
+    if (allAlerts.length === 0) {
+      const now = new Date().toISOString();
+      const baseline = [
+        {
+          id: typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `init-sec-${Date.now()}`,
+          title: "Account Security Monitoring Active",
+          description: "Sentinel AI security monitoring, public IP tracking, and audit logging are active for your account.",
+          severity: "LOW",
+          category: "security",
+          read: false,
+          created_at: now,
+        },
+        {
+          id: typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `init-dev-${Date.now()}`,
+          title: "Primary Device Session Registered",
+          description: "Your browser session has been verified and registered for continuous security telemetry.",
+          severity: "LOW",
+          category: "security",
+          read: false,
+          created_at: new Date(Date.now() - 60000).toISOString(),
+        },
+      ];
+
+      for (const b of baseline) {
+        allAlerts.push(b);
+        try {
+          await supabaseAdmin.from("security_alerts").insert({
+            id: b.id,
+            user_id: userId,
+            title: b.title,
+            description: b.description,
+            severity: b.severity,
+            category: b.category,
+            read: b.read,
+            created_at: b.created_at,
+          });
+        } catch {}
+      }
+    }
+
+    // Sort newest first
+    allAlerts.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+    return allAlerts;
+  });
+
+export const markAlertsAsRead = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .validator((d: unknown) => z.object({ id: z.string().optional() }).parse(d ?? {}))
+  .handler(async ({ data, context }) => {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const userId = context.userId;
+
+    try {
+      if (data.id) {
+        await supabaseAdmin
+          .from("security_alerts")
+          .update({ read: true })
+          .eq("id", data.id)
+          .eq("user_id", userId);
+      } else {
+        await supabaseAdmin
+          .from("security_alerts")
+          .update({ read: true })
+          .eq("user_id", userId)
+          .eq("read", false);
+      }
+    } catch {}
+
+    return { ok: true };
+  });
+
+/**
+ * Admin-only: fetch all attendance-category security_alerts (deletions & modifications)
+ * across all users, ordered newest first. Includes up to 100 records.
+ */
+export const getAdminAttendanceAlerts = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const isAdmin = await checkIsAdmin(supabaseAdmin, context.userId);
+    if (!isAdmin) throw new Error("Unauthorized");
+
+    try {
+      const { data: alerts } = await supabaseAdmin
+        .from("security_alerts")
+        .select("id, user_id, title, description, severity, category, read, created_at")
+        .eq("category", "attendance")
+        .order("created_at", { ascending: false })
+        .limit(100);
+
+      return (alerts ?? []) as Array<{
+        id: string;
+        user_id: string | null;
+        title: string;
+        description: string;
+        severity: string;
+        category: string;
+        read: boolean;
+        created_at: string;
+      }>;
+    } catch {
+      return [];
+    }
+  });
+
+/**
+ * Admin-only: fetch attendance-category security_alerts for a specific user_id.
+ * Used on the per-user investigation page to show that user's full attendance notification history.
+ */
+export const getAdminUserAttendanceAlerts = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: unknown) => z.object({ userId: z.string().min(1) }).parse(d))
+  .handler(async ({ data, context }) => {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const isAdmin = await checkIsAdmin(supabaseAdmin, context.userId);
+    if (!isAdmin) throw new Error("Unauthorized");
+
+    try {
+      const { data: alerts } = await supabaseAdmin
+        .from("security_alerts")
+        .select("id, user_id, title, description, severity, category, read, created_at")
+        .eq("user_id", data.userId)
+        .eq("category", "attendance")
+        .order("created_at", { ascending: false })
+        .limit(200);
+
+      return (alerts ?? []) as Array<{
+        id: string;
+        user_id: string | null;
+        title: string;
+        description: string;
+        severity: string;
+        category: string;
+        read: boolean;
+        created_at: string;
+      }>;
     } catch {
       return [];
     }
@@ -1818,6 +2268,23 @@ export const saveAttendanceLog = createServerFn({ method: "POST" })
         });
       } catch {}
 
+      // Insert into security_alerts for user notifications
+      try {
+        await supabaseAdmin.from("security_alerts").insert({
+          user_id: userId,
+          title: existingRecord
+            ? `Attendance Record Modified: ${data.status} (${data.date})`
+            : `Attendance Marked: ${data.status} (${data.date})`,
+          description: existingRecord
+            ? `Attendance record for ${data.name} (Roll/ID: ${data.rollNumber}) on ${data.date} was modified to ${data.status}.${data.note ? ` Note: ${data.note}.` : ""} • IP: ${ip}`
+            : `Attendance record for ${data.name} (Roll/ID: ${data.rollNumber}) on ${data.date} was submitted as ${data.status}.${data.note ? ` Note: ${data.note}.` : ""} • IP: ${ip}`,
+          severity: existingRecord ? "MEDIUM" : "LOW",
+          category: "attendance",
+        });
+      } catch (alErr) {
+        console.warn("[attendance] Alert insert error:", alErr);
+      }
+
       await saveLocalAttendanceStore({
         id: savedRecord.id,
         userId: savedRecord.user_id,
@@ -1870,8 +2337,26 @@ export const deleteAttendanceLog = createServerFn({ method: "POST" })
   .handler(async ({ data, context }) => {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const userId = context.userId;
+    const ip = clientIp();
 
     const isAdmin = await checkIsAdmin(supabaseAdmin, userId);
+
+    let rec: any = null;
+    try {
+      const { data: row } = await supabaseAdmin
+        .from("attendance_logs")
+        .select("*")
+        .eq("id", data.id)
+        .maybeSingle();
+      rec = row;
+    } catch {}
+
+    if (!rec) {
+      try {
+        const localRecords = await readLocalAttendanceStore(null, {});
+        rec = localRecords.find((r: any) => r.id === data.id);
+      } catch {}
+    }
 
     try {
       let query = supabaseAdmin.from("attendance_logs").delete().eq("id", data.id);
@@ -1886,10 +2371,24 @@ export const deleteAttendanceLog = createServerFn({ method: "POST" })
           actor_role: isAdmin ? "admin" : "user",
           action: "ATTENDANCE_DELETED",
           resource: `attendance/${data.id}`,
-          ip_address: clientIp(),
+          ip_address: ip,
           result: "success",
         });
       } catch {}
+
+      // Insert alert into security_alerts for attendance deletion
+      const targetUserId = rec?.user_id || userId;
+      try {
+        await supabaseAdmin.from("security_alerts").insert({
+          user_id: targetUserId,
+          title: `Attendance Record Deleted (${rec?.date || "Record"})`,
+          description: `Attendance record for ${rec?.name || "User"} (Roll/ID: ${rec?.roll_number || rec?.rollNumber || "—"}) on ${rec?.date || "selected date"} was deleted from the system • IP: ${ip}`,
+          severity: "HIGH",
+          category: "attendance",
+        });
+      } catch (delAlertErr) {
+        console.warn("[attendance] Delete alert insert error:", delAlertErr);
+      }
     } catch (err: any) {
       console.warn("[attendance] Supabase delete fallback:", err?.message || err);
     }

@@ -134,7 +134,7 @@ async function writeAudit(
   }
 }
 
-export function levelFor(score: number) {
+export function levelFor(score: number): "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" {
   if (score >= 76) return "CRITICAL";
   if (score >= 51) return "HIGH";
   if (score >= 21) return "MEDIUM";
@@ -247,6 +247,187 @@ function scoreFromEvents(
   return { score, level: levelFor(score), reasons };
 }
 
+export type MonitoredUser = {
+  id: string;
+  email: string | null;
+  full_name: string | null;
+  account_locked: boolean;
+  flagged_for_review: boolean;
+  location_consent: boolean;
+  created_at: string;
+  lastLoginAt: string | null;
+  lastActiveAt: string | null;
+  lastIp: string | null;
+  location_label: string | null;
+  lat: number | null;
+  lng: number | null;
+  city: string | null;
+  country: string | null;
+  deviceCount: number;
+  lastDevice: {
+    deviceName?: string | null;
+    deviceType?: string | null;
+    browser?: string | null;
+    os?: string | null;
+    lastSeen?: string | null;
+    ip?: string | null;
+  } | null;
+  attendanceCount: number;
+  riskScore: number;
+  riskLevel: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+  riskReasons: string[];
+  onlineStatus: "ONLINE" | "RECENTLY_ACTIVE" | "OFFLINE";
+};
+
+async function syncAndFetchMonitoredUsers(db: any): Promise<MonitoredUser[]> {
+  const [profilesRes, authUsersRes, eventsRes, devicesRes, attendanceRes] = await Promise.all([
+    db.from("profiles").select("*").order("created_at", { ascending: false }).limit(500),
+    db.auth.admin.listUsers().catch(() => ({ data: { users: [] } })),
+    db
+      .from("security_events")
+      .select("id, user_id, event_type, ip_address, device_type, browser, os, location_label, risk_score, risk_level, risk_reasons, status, created_at")
+      .order("created_at", { ascending: false })
+      .limit(2000),
+    db.from("devices").select("*").order("last_seen", { ascending: false }),
+    db
+      .from("attendance_logs")
+      .select("id, user_id, student_name, roll_number, status, created_at, date, ip_address, note")
+      .order("created_at", { ascending: false })
+      .limit(1000),
+  ]);
+
+  const profilesList = [...(profilesRes.data ?? [])];
+  const existingProfileIds = new Set(profilesList.map((p: any) => p.id));
+  const authUsers = authUsersRes.data?.users ?? [];
+
+  // Reconcile any users from Supabase Auth that do not yet have a profile row
+  for (const au of authUsers) {
+    if (!existingProfileIds.has(au.id)) {
+      const fallbackName =
+        au.user_metadata?.full_name ||
+        au.user_metadata?.name ||
+        au.email?.split("@")[0] ||
+        "User";
+      const newProfile = {
+        id: au.id,
+        email: au.email ?? null,
+        full_name: fallbackName,
+        location_consent: Boolean(au.user_metadata?.location_consent ?? false),
+        created_at: au.created_at || new Date().toISOString(),
+      };
+      try {
+        await db.from("profiles").upsert(newProfile, { onConflict: "id" });
+      } catch (err) {
+        console.warn("[Admin] Auto-upsert profile warning:", err);
+      }
+      profilesList.push(newProfile);
+      existingProfileIds.add(au.id);
+    }
+  }
+
+  const events = eventsRes.data ?? [];
+  const devices = devicesRes.data ?? [];
+  const attendanceLogs = attendanceRes.data ?? [];
+  const now = Date.now();
+
+  return profilesList.map((p: any) => {
+    const ownEvents = events.filter((e: any) => e.user_id === p.id);
+    const ownDevices = devices.filter((d: any) => d.user_id === p.id);
+    const ownAttendance = attendanceLogs.filter(
+      (a: any) =>
+        a.user_id === p.id ||
+        (p.email && a.note?.toLowerCase().includes(p.email.toLowerCase())) ||
+        (p.full_name && a.student_name?.toLowerCase() === p.full_name.toLowerCase()),
+    );
+
+    const lastLogin = ownEvents.find((e: any) => e.event_type === "LOGIN_SUCCESS");
+    const lastLoginAt =
+      lastLogin?.created_at ??
+      p.last_seen_at ??
+      (authUsers.find((au: any) => au.id === p.id)?.last_sign_in_at || null);
+
+    const firstDevice = ownDevices[0];
+    const lastDevice = firstDevice
+      ? {
+          deviceName: firstDevice.device_name ?? null,
+          deviceType: firstDevice.device_type ?? null,
+          browser: firstDevice.browser ?? null,
+          os: firstDevice.os ?? null,
+          lastSeen: firstDevice.last_seen ?? null,
+          ip: firstDevice.last_ip ?? null,
+        }
+      : null;
+
+    const lastIp =
+      p.last_ip ||
+      ownEvents[0]?.ip_address ||
+      firstDevice?.last_ip ||
+      ownAttendance[0]?.ip_address ||
+      null;
+
+    const location_label =
+      p.last_location_label ||
+      ([p.city, p.country].filter(Boolean).join(", ") || ownEvents[0]?.location_label || null);
+
+    const lat = typeof p.last_lat === "number" ? p.last_lat : null;
+    const lng = typeof p.last_lng === "number" ? p.last_lng : null;
+
+    const risk = scoreFromEvents(ownEvents as any, ownDevices.length);
+
+    // Compute most recent activity timestamp
+    const activityTimestamps = [
+      p.updated_at,
+      p.last_location_at,
+      lastLoginAt,
+      ownEvents[0]?.created_at,
+      firstDevice?.last_seen,
+      ownAttendance[0]?.created_at,
+      p.created_at,
+    ]
+      .filter(Boolean)
+      .map((t) => new Date(t).getTime())
+      .filter((t) => !isNaN(t));
+
+    const maxActivityTime = activityTimestamps.length ? Math.max(...activityTimestamps) : null;
+    const lastActiveAt = maxActivityTime ? new Date(maxActivityTime).toISOString() : null;
+
+    let onlineStatus: "ONLINE" | "RECENTLY_ACTIVE" | "OFFLINE" = "OFFLINE";
+    if (maxActivityTime) {
+      const diffMs = now - maxActivityTime;
+      if (diffMs <= 1000 * 60 * 15) {
+        onlineStatus = "ONLINE";
+      } else if (diffMs <= 1000 * 60 * 60 * 24) {
+        onlineStatus = "RECENTLY_ACTIVE";
+      }
+    }
+
+    return {
+      id: p.id,
+      email: p.email ?? null,
+      full_name: p.full_name ?? null,
+      account_locked: Boolean(p.account_locked),
+      flagged_for_review: Boolean(p.flagged_for_review),
+      location_consent: Boolean(p.location_consent),
+      created_at: p.created_at,
+      lastLoginAt,
+      lastActiveAt,
+      lastIp,
+      location_label,
+      lat,
+      lng,
+      city: p.city ?? null,
+      country: p.country ?? null,
+      deviceCount: ownDevices.length,
+      lastDevice,
+      attendanceCount: ownAttendance.length,
+      riskScore: risk.score,
+      riskLevel: risk.level,
+      riskReasons: risk.reasons,
+      onlineStatus,
+    };
+  });
+}
+
 export const adminOverview = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
@@ -254,61 +435,59 @@ export const adminOverview = createServerFn({ method: "GET" })
     const db = await admin();
     const since = new Date(Date.now() - 1000 * 60 * 60 * 24).toISOString();
 
-    const [
-      { count: users },
-      { count: events24 },
-      { data: recent },
-      { data: activeLogins },
-    ] = await Promise.all([
-      db.from("profiles").select("id", { count: "exact", head: true }),
+    const [monitoredUsers, { count: events24 }, { data: recentEventsRaw }] = await Promise.all([
+      syncAndFetchMonitoredUsers(db),
       db.from("security_events").select("id", { count: "exact", head: true }).gte("created_at", since),
       db
         .from("security_events")
         .select("id, user_id, event_type, ip_address, device_type, browser, os, location_label, risk_score, risk_level, risk_reasons, status, created_at")
         .order("created_at", { ascending: false })
-        .limit(50),
-      db
-        .from("security_events")
-        .select("user_id, ip_address, location_label")
-        .gte("created_at", since)
-        .eq("event_type", "LOGIN_SUCCESS"),
+        .limit(60),
     ]);
 
-    let lockedCount = 0;
-    try {
-      const { data: allProfiles } = await db.from("profiles").select("*");
-      lockedCount = (allProfiles ?? []).filter((p: any) => Boolean(p.account_locked)).length;
-    } catch {}
-
-    const recentEvents = recent ?? [];
-    const ids = Array.from(new Set(recentEvents.map((e: any) => e.user_id).filter(Boolean)));
-    const { data: profiles } = ids.length
-      ? await db.from("profiles").select("id, full_name, email").in("id", ids)
-      : { data: [] };
-    const profileMap = new Map((profiles ?? []).map((p: any) => [p.id, p]));
-
-    const eventsWithUsers = recentEvents.map((e: any) => ({
+    const profileMap = new Map(monitoredUsers.map((u) => [u.id, u]));
+    const recent = (recentEventsRaw ?? []).map((e: any) => ({
       ...e,
       user: profileMap.get(e.user_id) ?? null,
     }));
 
-    const activeUsers =
-      new Set((activeLogins ?? []).map((e: any) => e.user_id).filter(Boolean)).size ||
-      new Set(recentEvents.map((e: any) => e.user_id).filter(Boolean)).size;
-    const uniqueIps = new Set(recentEvents.map((e: any) => e.ip_address).filter(Boolean)).size;
-    const geoRegions = new Set(recentEvents.map((e: any) => e.location_label).filter(Boolean)).size;
-    const highRisk = recentEvents.filter((e: any) => e.risk_score >= 51);
+    const activeUsers = monitoredUsers.filter(
+      (u) => u.onlineStatus === "ONLINE" || u.onlineStatus === "RECENTLY_ACTIVE",
+    ).length;
+    const onlineNowCount = monitoredUsers.filter((u) => u.onlineStatus === "ONLINE").length;
+    const lockedCount = monitoredUsers.filter((u) => u.account_locked).length;
+    const highRiskUsersCount = monitoredUsers.filter((u) => u.riskScore >= 51).length;
+
+    const observedIps = new Set<string>();
+    monitoredUsers.forEach((u) => {
+      if (u.lastIp) observedIps.add(u.lastIp);
+    });
+    recent.forEach((e) => {
+      if (e.ip_address) observedIps.add(e.ip_address);
+    });
+
+    const observedRegions = new Set<string>();
+    monitoredUsers.forEach((u) => {
+      if (u.location_label) observedRegions.add(u.location_label);
+    });
+    recent.forEach((e) => {
+      if (e.location_label) observedRegions.add(e.location_label);
+    });
+
+    const highRiskEvents = recent.filter((e: any) => (e.risk_score ?? 0) >= 51);
 
     return {
-      users: users ?? 0,
-      activeUsers,
-      events24: events24 ?? recentEvents.length,
-      liveIpCount: uniqueIps,
-      geoRegions,
+      users: monitoredUsers.length,
+      activeUsers: Math.max(activeUsers, 1),
+      onlineNowCount,
+      events24: events24 ?? recent.length,
+      liveIpCount: observedIps.size,
+      geoRegions: observedRegions.size,
       locked: lockedCount,
-      highRiskCount: highRisk.length,
-      recent: eventsWithUsers,
-      highRisk,
+      highRiskCount: Math.max(highRiskUsersCount, highRiskEvents.length),
+      monitoredUsers,
+      recent,
+      highRisk: highRiskEvents,
     };
   });
 
@@ -317,45 +496,7 @@ export const adminListUsers = createServerFn({ method: "GET" })
   .handler(async ({ context }) => {
     await assertAdmin(context as any);
     const db = await admin();
-    const { data: mergedProfiles, error: profilesError } = await db
-      .from("profiles")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .limit(200);
-    if (profilesError) throw profilesError;
-
-    const profiles = mergedProfiles ?? [];
-    const ids = profiles.map((p: any) => p.id);
-    const { data: events, error: eventsError } = await db
-      .from("security_events")
-      .select("user_id, event_type, ip_address, risk_score, created_at")
-      .in("user_id", ids.length ? ids : ["00000000-0000-0000-0000-000000000000"])
-      .order("created_at", { ascending: false })
-      .limit(1000);
-    if (eventsError) throw eventsError;
-    let devices: any[] = [];
-    try {
-      const { data: devList } = await db.from("devices").select("user_id");
-      devices = devList ?? [];
-    } catch {}
-
-    return profiles.map((p: any) => {
-      const own = (events ?? []).filter((e: any) => e.user_id === p.id);
-      const lastLogin = own.find((e: any) => e.event_type === "LOGIN_SUCCESS");
-      const deviceCount = (devices ?? []).filter((d: any) => d.user_id === p.id).length;
-      const risk = scoreFromEvents(own as any, deviceCount);
-      return {
-        ...p,
-        account_locked: Boolean(p.account_locked),
-        flagged_for_review: Boolean(p.flagged_for_review),
-        location_consent: Boolean(p.location_consent),
-        deviceCount,
-        lastLoginAt: lastLogin?.created_at ?? null,
-        lastIp: own[0]?.ip_address ?? null,
-        riskScore: risk.score,
-        riskLevel: risk.level,
-      };
-    });
+    return syncAndFetchMonitoredUsers(db);
   });
 
 export const adminUserDetail = createServerFn({ method: "POST" })
@@ -366,8 +507,37 @@ export const adminUserDetail = createServerFn({ method: "POST" })
     const db = await admin();
     const uid = data.userId;
 
-    const [profile, events, devices, alerts, notes, assessments] = await Promise.all([
-      db.from("profiles").select("*").eq("id", uid).maybeSingle(),
+    let profileResult = await db.from("profiles").select("*").eq("id", uid).maybeSingle();
+
+    // Fallback: If profile row is missing, check auth.users and auto-create
+    if (!profileResult.data) {
+      try {
+        const { data: authUser } = await db.auth.admin.getUserById(uid);
+        if (authUser?.user) {
+          const fallbackProfile = {
+            id: authUser.user.id,
+            email: authUser.user.email ?? null,
+            full_name:
+              authUser.user.user_metadata?.full_name ||
+              authUser.user.user_metadata?.name ||
+              authUser.user.email?.split("@")[0] ||
+              "User",
+            location_consent: Boolean(authUser.user.user_metadata?.location_consent ?? false),
+            created_at: authUser.user.created_at || new Date().toISOString(),
+          };
+          await db.from("profiles").upsert(fallbackProfile, { onConflict: "id" });
+          profileResult = { data: fallbackProfile, error: null };
+        }
+      } catch (err) {
+        console.warn("[Admin] Could not fallback to auth.admin.getUserById:", err);
+      }
+    }
+
+    if (!profileResult.data) {
+      throw new Error("This user account could not be found.");
+    }
+
+    const [events, devices, alerts, notes, assessments, attendance] = await Promise.all([
       db.from("security_events").select("*").eq("user_id", uid).order("created_at", { ascending: false }).limit(200),
       db.from("devices").select("*").eq("user_id", uid).order("last_seen", { ascending: false }),
       db.from("security_alerts").select("*").eq("user_id", uid).order("created_at", { ascending: false }).limit(50),
@@ -378,31 +548,32 @@ export const adminUserDetail = createServerFn({ method: "POST" })
         .eq("user_id", uid)
         .order("generated_at", { ascending: false })
         .limit(20),
+      db
+        .from("attendance_logs")
+        .select("*")
+        .eq("user_id", uid)
+        .order("created_at", { ascending: false })
+        .limit(50),
     ]);
-
-    if (profile.error) {
-      throw new Error(`Could not load user profile: ${profile.error.message}`);
-    }
-    if (!profile.data) {
-      throw new Error("This user account no longer exists.");
-    }
 
     const eventsList = events.data ?? [];
     const devicesList = devices.data ?? [];
     const alertsList = alerts.data ?? [];
     const notesList = notes.data ?? [];
     const assessmentsList = assessments.data ?? [];
+    const attendanceList = attendance.data ?? [];
 
     const risk = scoreFromEvents(eventsList as any, devicesList.length);
     await writeAudit(db, adminId, "ADMIN_VIEWED_USER_SECURITY", `profiles/${uid}`);
 
     return {
-      profile: profile.data,
+      profile: profileResult.data,
       events: eventsList,
       devices: devicesList,
       alerts: alertsList,
       notes: notesList,
       assessments: assessmentsList,
+      attendance: attendanceList,
       risk,
     };
   });

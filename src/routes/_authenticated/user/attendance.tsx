@@ -109,6 +109,7 @@ function AttendanceDashboard() {
     },
     onSuccess: (res, vars) => {
       queryClient.invalidateQueries({ queryKey: ["attendance", "logs"] });
+      queryClient.invalidateQueries({ queryKey: ["security_alerts"] });
       toast.success(`Attendance saved for ${vars.name} (${vars.rollNumber})`);
       setNote("");
 
@@ -138,6 +139,7 @@ function AttendanceDashboard() {
     },
     onSuccess: (record) => {
       queryClient.invalidateQueries({ queryKey: ["attendance", "logs"] });
+      queryClient.invalidateQueries({ queryKey: ["security_alerts"] });
       toast.success(`Deleted attendance record for ${record.date}`);
 
       notifyChangeFn({

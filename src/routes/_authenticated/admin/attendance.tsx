@@ -1,7 +1,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { ClipboardCheck, RefreshCw, Search, Trash2 } from "lucide-react";
+import { ClipboardCheck, FileSpreadsheet, FileText, RefreshCw, Search, Trash2 } from "lucide-react";
 import { useMemo, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 
@@ -9,6 +9,7 @@ import { AdminShell } from "@/components/AdminShell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { exportAttendanceAuditPdf, exportToCsv } from "@/lib/report-export";
 import {
   deleteAttendanceLog,
   getAttendanceLogs,
@@ -116,6 +117,7 @@ function AdminAttendance() {
     },
     onSuccess: (res, vars) => {
       queryClient.invalidateQueries({ queryKey: ["attendance", "logs"] });
+      queryClient.invalidateQueries({ queryKey: ["security_alerts"] });
       toast.success(`Attendance saved for ${vars.name} (${vars.rollNumber})`);
       setName("");
       setRollNumber("");
@@ -148,6 +150,7 @@ function AdminAttendance() {
     },
     onSuccess: (record) => {
       queryClient.invalidateQueries({ queryKey: ["attendance", "logs"] });
+      queryClient.invalidateQueries({ queryKey: ["security_alerts"] });
       toast.success(`Deleted attendance record for ${record.name}`);
 
       notifyChangeFn({
@@ -347,6 +350,45 @@ function AdminAttendance() {
                 Clear date
               </Button>
             )}
+            <div className="ml-auto flex items-center gap-1.5">
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-9 gap-1.5 text-xs shadow-2xs"
+                onClick={() => {
+                  if (!filteredRecords.length) {
+                    toast.warning("No attendance records to export");
+                    return;
+                  }
+                  const stamp = new Date().toISOString().slice(0, 10);
+                  const headers = ["Date", "Name", "Roll / Staff ID", "Status", "Verified IP", "Audit Note", "Created At"];
+                  const rows = filteredRecords.map((r) => [r.date, r.name, r.rollNumber, r.status, r.ipAddress, r.note, r.createdAt]);
+                  exportToCsv(`Sentinel_Attendance_${stamp}`, headers, rows);
+                  toast.success("Attendance CSV exported successfully");
+                }}
+              >
+                <FileSpreadsheet className="size-3.5 text-emerald-600" />
+                Export CSV
+              </Button>
+              <Button
+                size="sm"
+                className="h-9 gap-1.5 bg-navy text-navy-foreground text-xs shadow-2xs hover:bg-navy/90"
+                onClick={() => {
+                  if (!filteredRecords.length) {
+                    toast.warning("No attendance records to export");
+                    return;
+                  }
+                  exportAttendanceAuditPdf(filteredRecords, {
+                    dateRange: dateFilter || "Current View",
+                    generatedBy: "Sentinel Admin",
+                  });
+                  toast.success("Attendance PDF Audit Report generated");
+                }}
+              >
+                <FileText className="size-3.5 text-blue-400" />
+                Export PDF
+              </Button>
+            </div>
           </div>
         </div>
 

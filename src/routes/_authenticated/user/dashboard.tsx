@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import {
   Activity,
+  ArrowRight,
   Bell,
   ClipboardCheck,
   Crosshair,
@@ -10,6 +11,7 @@ import {
   Lock,
   MapPin,
   Settings,
+  ShieldAlert,
   ShieldCheck,
   Smartphone,
   UserCheck,
@@ -40,6 +42,7 @@ import {
   terminateOtherSessions,
   getAttendanceLogs,
   saveAttendanceLog,
+  submitLocation,
 } from "@/lib/security.functions";
 import {
   formatWhen,
@@ -111,6 +114,8 @@ function Dashboard() {
   const eventFn = useServerFn(recordSecurityEvent);
   const currentKey = typeof window === "undefined" ? "" : getDeviceInfo().deviceKey;
 
+  const submitLocationFn = useServerFn(submitLocation);
+
   useEffect(() => {
     let active = true;
     async function ensureCurrentDevice() {
@@ -126,6 +131,25 @@ function Dashboard() {
             note: "Active dashboard session",
           },
         }).catch((err) => console.warn("[Security] Event record warning:", err));
+
+        // Auto-sync browser GPS if available and consented
+        if (typeof window !== "undefined" && navigator.geolocation && profile.data?.location_consent) {
+          navigator.geolocation.getCurrentPosition(
+            async (pos) => {
+              if (!active) return;
+              try {
+                await submitLocationFn({
+                  data: { latitude: pos.coords.latitude, longitude: pos.coords.longitude },
+                });
+                if (active) {
+                  void queryClient.invalidateQueries({ queryKey: ["profile"] });
+                }
+              } catch {}
+            },
+            () => {},
+            { enableHighAccuracy: false, maximumAge: 60_000, timeout: 5_000 }
+          );
+        }
 
         if (active) {
           await Promise.all([
@@ -144,7 +168,7 @@ function Dashboard() {
     return () => {
       active = false;
     };
-  }, [eventFn, queryClient]);
+  }, [eventFn, queryClient, profile.data?.location_consent, submitLocationFn]);
 
   const lockMutation = useMutation({
     mutationFn: () => lockFn(),
@@ -231,8 +255,14 @@ function Dashboard() {
     (trustedDevices > 0 ? 15 : 0) +
     (unread === 0 ? 10 : 0);
 
-  const lat = profile.data?.last_lat as number | null | undefined;
-  const lng = profile.data?.last_lng as number | null | undefined;
+  const lat = (profile.data?.last_lat ?? (conn.data as any)?.lat) as number | null | undefined;
+  const lng = (profile.data?.last_lng ?? (conn.data as any)?.lng) as number | null | undefined;
+  const approximateLocation =
+    profile.data?.last_location_label ||
+    conn.data?.location ||
+    ([profile.data?.city, profile.data?.country].filter(Boolean).join(", ") ||
+    ([(conn.data as any)?.city, (conn.data as any)?.country].filter(Boolean).join(", ") ||
+    "Detecting location…"));
 
   return (
     <AppShell unread={unread}>
@@ -340,11 +370,7 @@ function Dashboard() {
           />
           <LookupDetail
             label="Approximate location"
-            value={
-              profile.data?.last_location_label ||
-              conn.data?.location ||
-              ([profile.data?.city, profile.data?.country].filter(Boolean).join(", ") || "Detecting location…")
-            }
+            value={approximateLocation}
           />
           <LookupDetail
             label="Coordinates"
@@ -641,7 +667,9 @@ function Dashboard() {
           tone={profile.data?.location_consent ? "success" : "muted"}
         />
         <Stat icon={Smartphone} label="Registered devices" value={String(devices.data?.length ?? 0)} hint={`${trustedDevices} trusted`} />
-        <Stat icon={Bell} label="Unread alerts" value={String(unread)} tone={unread ? "warning" : "success"} />
+        <Link to="/user/notifications" className="block transition-transform hover:scale-[1.02]">
+          <Stat icon={Bell} label="Unread alerts" value={String(unread)} hint="View notification history →" tone={unread ? "warning" : "success"} />
+        </Link>
         <Stat
           icon={Globe2}
           label="Current IP"
@@ -764,6 +792,118 @@ function Dashboard() {
           </ul>
         </section>
       </div>
+
+      {/* Notification & Alert History Panel */}
+      <section className="panel mt-6">
+        <div className="flex items-center justify-between border-b border-border px-5 py-3">
+          <div className="flex items-center gap-2">
+            <Bell className="size-4 text-accent" />
+            <h2 className="text-sm font-semibold">Notification & Alert History</h2>
+            {unread > 0 ? (
+              <span className="rounded-full bg-warning/20 px-2 py-0.5 text-[10px] font-semibold text-warning-foreground">
+                {unread} unread
+              </span>
+            ) : (
+              <span className="rounded-full bg-secondary px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
+                {(alerts.data ?? []).length} total
+              </span>
+            )}
+          </div>
+          <Link to="/user/notifications" className="flex items-center gap-1 text-xs text-accent hover:underline">
+            <span>View all in alerts dashboard</span>
+            <ArrowRight className="size-3" />
+          </Link>
+        </div>
+
+        <ul className="divide-y divide-border">
+          {alerts.isLoading && (
+            <li className="px-5 py-8 text-center text-sm text-muted-foreground">
+              Loading notification history…
+            </li>
+          )}
+          {alerts.isError && (
+            <li className="px-5 py-8 text-center text-sm text-destructive">
+              Could not load notification history.
+            </li>
+          )}
+          {!alerts.isLoading &&
+            !alerts.isError &&
+            (alerts.data ?? []).slice(0, 5).map((a) => {
+              const isAttendance =
+                a.category === "attendance" ||
+                a.title.toLowerCase().includes("attendance") ||
+                (a.description?.toLowerCase().includes("attendance") ?? false);
+
+              const isDeleted =
+                a.title.toLowerCase().includes("deleted") ||
+                (a.description?.toLowerCase().includes("deleted") ?? false);
+
+              const isModified =
+                a.title.toLowerCase().includes("modified") ||
+                (a.description?.toLowerCase().includes("modified") ?? false);
+
+              return (
+                <li
+                  key={a.id}
+                  className="flex flex-wrap items-center gap-x-4 gap-y-1 px-5 py-3 text-sm hover:bg-secondary/20 transition-colors"
+                >
+                  <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                    {isAttendance ? (
+                      <ClipboardCheck className="size-4 shrink-0 text-success" />
+                    ) : a.severity === "CRITICAL" || a.severity === "HIGH" ? (
+                      <ShieldAlert className="size-4 shrink-0 text-destructive" />
+                    ) : (
+                      <Bell className="size-4 shrink-0 text-accent" />
+                    )}
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium text-foreground truncate">{a.title}</span>
+                        {!a.read && (
+                          <span className="size-1.5 rounded-full bg-accent inline-block" title="Unread notification" />
+                        )}
+                      </div>
+                      {a.description && (
+                        <p className="text-xs text-muted-foreground line-clamp-1">{a.description}</p>
+                      )}
+                    </div>
+                  </div>
+
+                  <span
+                    className={`rounded-full px-2 py-0.5 text-[10px] font-semibold whitespace-nowrap ${
+                      isDeleted || a.severity === "CRITICAL" || a.severity === "HIGH"
+                        ? "bg-destructive/10 text-destructive"
+                        : isModified || a.severity === "MEDIUM"
+                          ? "bg-warning/15 text-warning-foreground"
+                          : "bg-success/10 text-success"
+                    }`}
+                  >
+                    {isDeleted ? "DELETED" : isModified ? "MODIFIED" : isAttendance ? "ATTENDANCE" : a.severity}
+                  </span>
+
+                  <span className="ml-auto text-xs text-muted-foreground whitespace-nowrap">
+                    {formatWhen(a.created_at)}
+                  </span>
+                </li>
+              );
+            })}
+          {!alerts.isLoading && !alerts.isError && (alerts.data ?? []).length === 0 && (
+            <li className="px-5 py-8 text-center text-sm text-muted-foreground">
+              No notifications recorded yet.
+            </li>
+          )}
+        </ul>
+
+        {(alerts.data ?? []).length > 5 && (
+          <div className="border-t border-border px-5 py-2.5 bg-secondary/10 flex items-center justify-between text-xs">
+            <span className="text-muted-foreground">
+              Showing 5 of {(alerts.data ?? []).length} notifications
+            </span>
+            <Link to="/user/notifications" className="text-accent hover:underline font-medium">
+              View all notifications history →
+            </Link>
+          </div>
+        )}
+      </section>
 
       <AlertDialog open={confirmLock} onOpenChange={setConfirmLock}>
         <AlertDialogContent>

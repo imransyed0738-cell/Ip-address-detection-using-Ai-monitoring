@@ -19,15 +19,22 @@ export function useAdminRealtime(): AdminRealtimeStatus {
         void queryClient.invalidateQueries({ queryKey: ["admin"] });
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "security_events" }, () => {
-        void queryClient.invalidateQueries({ queryKey: ["admin", "events"] });
-        void queryClient.invalidateQueries({ queryKey: ["admin", "overview"] });
-        void queryClient.invalidateQueries({ queryKey: ["admin", "users"] });
+        void queryClient.invalidateQueries({ queryKey: ["admin"] });
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "security_alerts" }, () => {
         void queryClient.invalidateQueries({ queryKey: ["admin"] });
       })
+      .on("postgres_changes", { event: "*", schema: "public", table: "attendance_logs" }, () => {
+        void queryClient.invalidateQueries({ queryKey: ["admin"] });
+      })
       .on("postgres_changes", { event: "*", schema: "public", table: "audit_logs" }, () => {
-        void queryClient.invalidateQueries({ queryKey: ["admin", "audit"] });
+        void queryClient.invalidateQueries({ queryKey: ["admin"] });
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "user_roles" }, () => {
+        void queryClient.invalidateQueries({ queryKey: ["admin"] });
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "security_risk_assessments" }, () => {
+        void queryClient.invalidateQueries({ queryKey: ["admin"] });
       })
       .subscribe((nextStatus) => {
         if (
