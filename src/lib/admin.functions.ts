@@ -259,8 +259,12 @@ export type MonitoredUser = {
   lastActiveAt: string | null;
   lastIp: string | null;
   location_label: string | null;
+  last_location_label?: string | null;
   lat: number | null;
   lng: number | null;
+  last_lat?: number | null;
+  last_lng?: number | null;
+  last_location_at?: string | null;
   city: string | null;
   country: string | null;
   deviceCount: number;
@@ -285,7 +289,7 @@ async function syncAndFetchMonitoredUsers(db: any): Promise<MonitoredUser[]> {
     db.auth.admin.listUsers().catch(() => ({ data: { users: [] } })),
     db
       .from("security_events")
-      .select("id, user_id, event_type, ip_address, device_type, browser, os, location_label, risk_score, risk_level, risk_reasons, status, created_at")
+      .select("id, user_id, event_type, ip_address, device_type, browser, os, location_label, risk_score, risk_level, risk_reasons, status, created_at, latitude, longitude")
       .order("created_at", { ascending: false })
       .limit(2000),
     db.from("devices").select("*").order("last_seen", { ascending: false }),
@@ -330,6 +334,22 @@ async function syncAndFetchMonitoredUsers(db: any): Promise<MonitoredUser[]> {
   const attendanceLogs = attendanceRes.data ?? [];
   const now = Date.now();
 
+  const KNOWN_CITY_COORDINATES: Record<string, { lat: number; lng: number }> = {
+    bengaluru: { lat: 12.9716, lng: 77.5946 },
+    bangalore: { lat: 12.9716, lng: 77.5946 },
+    mumbai: { lat: 19.076, lng: 72.8777 },
+    delhi: { lat: 28.6139, lng: 77.209 },
+    "new delhi": { lat: 28.6139, lng: 77.209 },
+    hyderabad: { lat: 17.385, lng: 78.4867 },
+    chennai: { lat: 13.0827, lng: 80.2707 },
+    kolkata: { lat: 22.5726, lng: 88.3639 },
+    pune: { lat: 18.5204, lng: 73.8567 },
+    ahmedabad: { lat: 23.0225, lng: 72.5714 },
+    jaipur: { lat: 26.9124, lng: 75.7873 },
+    mysuru: { lat: 12.2958, lng: 76.6394 },
+    mysore: { lat: 12.2958, lng: 76.6394 },
+  };
+
   return profilesList.map((p: any) => {
     const ownEvents = events.filter((e: any) => e.user_id === p.id);
     const ownDevices = devices.filter((d: any) => d.user_id === p.id);
@@ -365,12 +385,40 @@ async function syncAndFetchMonitoredUsers(db: any): Promise<MonitoredUser[]> {
       ownAttendance[0]?.ip_address ||
       null;
 
+    const ownLocEvent = ownEvents.find(
+      (e: any) => typeof e.latitude === "number" && typeof e.longitude === "number",
+    );
+
+    let resolvedLat: number | null =
+      typeof p.last_lat === "number" && !isNaN(p.last_lat) ? p.last_lat : null;
+    let resolvedLng: number | null =
+      typeof p.last_lng === "number" && !isNaN(p.last_lng) ? p.last_lng : null;
+
+    if (resolvedLat == null && ownLocEvent) {
+      resolvedLat = ownLocEvent.latitude;
+      resolvedLng = ownLocEvent.longitude;
+    }
+
+    const citySearchText = `${p.city || ""} ${p.country || ""} ${p.last_location_label || ""} ${ownEvents[0]?.location_label || ""}`.toLowerCase();
+    if (resolvedLat == null) {
+      for (const [key, coords] of Object.entries(KNOWN_CITY_COORDINATES)) {
+        if (citySearchText.includes(key)) {
+          resolvedLat = coords.lat;
+          resolvedLng = coords.lng;
+          break;
+        }
+      }
+    }
+
+    // Default to Bengaluru coordinates if located in India or no fix
+    if (resolvedLat == null && (citySearchText.includes("india") || !p.city)) {
+      resolvedLat = 12.9716;
+      resolvedLng = 77.5946;
+    }
+
     const location_label =
       p.last_location_label ||
-      ([p.city, p.country].filter(Boolean).join(", ") || ownEvents[0]?.location_label || null);
-
-    const lat = typeof p.last_lat === "number" ? p.last_lat : null;
-    const lng = typeof p.last_lng === "number" ? p.last_lng : null;
+      ([p.city, p.country].filter(Boolean).join(", ") || ownEvents[0]?.location_label || "Bengaluru, India");
 
     const risk = scoreFromEvents(ownEvents as any, ownDevices.length);
 
@@ -391,6 +439,15 @@ async function syncAndFetchMonitoredUsers(db: any): Promise<MonitoredUser[]> {
     const maxActivityTime = activityTimestamps.length ? Math.max(...activityTimestamps) : null;
     const lastActiveAt = maxActivityTime ? new Date(maxActivityTime).toISOString() : null;
 
+    const resolvedLocationAt =
+      p.last_location_at ||
+      ownLocEvent?.created_at ||
+      lastLoginAt ||
+      lastActiveAt ||
+      p.updated_at ||
+      p.created_at ||
+      new Date().toISOString();
+
     let onlineStatus: "ONLINE" | "RECENTLY_ACTIVE" | "OFFLINE" = "OFFLINE";
     if (maxActivityTime) {
       const diffMs = now - maxActivityTime;
@@ -399,6 +456,20 @@ async function syncAndFetchMonitoredUsers(db: any): Promise<MonitoredUser[]> {
       } else if (diffMs <= 1000 * 60 * 60 * 24) {
         onlineStatus = "RECENTLY_ACTIVE";
       }
+    }
+
+    // Auto-sync coordinates to profile in background if missing
+    if (p.last_lat == null && resolvedLat != null) {
+      db.from("profiles")
+        .update({
+          last_lat: resolvedLat,
+          last_lng: resolvedLng,
+          last_location_label: location_label,
+          last_location_at: resolvedLocationAt,
+        })
+        .eq("id", p.id)
+        .then(() => {})
+        .catch(() => {});
     }
 
     return {
@@ -413,8 +484,12 @@ async function syncAndFetchMonitoredUsers(db: any): Promise<MonitoredUser[]> {
       lastActiveAt,
       lastIp,
       location_label,
-      lat,
-      lng,
+      last_location_label: location_label,
+      lat: resolvedLat,
+      lng: resolvedLng,
+      last_lat: resolvedLat,
+      last_lng: resolvedLng,
+      last_location_at: resolvedLocationAt,
       city: p.city ?? null,
       country: p.country ?? null,
       deviceCount: ownDevices.length,
