@@ -7,6 +7,7 @@ dist-ssr/
 .tanstack/
 .nitro/
 .wrangler/
+.vercel/
 
 # Local environment and secrets
 .env
@@ -29,4 +30,3 @@ pnpm-debug.log*
 .DS_Store
 .otp-storage.json
 .attendance_store.json
-.vercel/
