@@ -18,6 +18,7 @@ import {
   sendForgotPasswordOtp,
   sendRegistrationOtp,
   verifyRegistrationOtp,
+  registerVerifiedUser,
   resetPasswordWithOtp,
 } from "@/lib/auth-otp.functions";
 
@@ -73,11 +74,9 @@ function AuthPage() {
   const [busy, setBusy] = useState(false);
   const [code, setCode] = useState("");
   const [factorId, setFactorId] = useState<string | null>(null);
-  const [pendingEmail, setPendingEmail] = useState<string | null>(null);
   const [recoveryEmail, setRecoveryEmail] = useState<string | null>(null);
   const [forgotMode, setForgotMode] = useState(false);
   const [forgotInputEmail, setForgotInputEmail] = useState("");
-  const [resendIn, setResendIn] = useState(0);
   const [otpResendIn, setOtpResendIn] = useState(0);
   const [loginError, setLoginError] = useState<string | null>(null);
   const [isResetPasswordMode, setIsResetPasswordMode] = useState(false);
@@ -86,12 +85,6 @@ function AuthPage() {
   const [pendingRegisterData, setPendingRegisterData] = useState<PendingRegisterData | null>(null);
   const [registerOtpInput, setRegisterOtpInput] = useState("");
   const [registerOtpResendIn, setRegisterOtpResendIn] = useState(0);
-
-  useEffect(() => {
-    if (resendIn <= 0) return;
-    const t = setTimeout(() => setResendIn((s) => s - 1), 1000);
-    return () => clearTimeout(t);
-  }, [resendIn]);
 
   useEffect(() => {
     if (otpResendIn <= 0) return;
@@ -309,67 +302,56 @@ function AuthPage() {
 
     setBusy(true);
     try {
-      // Step 2: Verify the 6-digit OTP
-      await verifyRegistrationOtp({
-        data: {
-          email: pendingRegisterData.email,
-          otp: token,
-        },
-      });
-
-      // Step 3: Create the user account in Supabase
       const { full_name, email, password } = pendingRegisterData;
 
-      const { data, error } = await supabase.auth.signUp({
-        email,
-        password,
-        options: {
-          emailRedirectTo: `${window.location.origin}/auth`,
-          data: { full_name },
+      // Step 1: Verify OTP and create/activate the user account in Supabase (with email_confirm: true)
+      await registerVerifiedUser({
+        data: {
+          email,
+          otp: token,
+          password,
+          fullName: full_name,
         },
       });
 
-      if (error) {
-        const weakPassword =
-          error.code === "weak_password" || /weak password|known to be weak|pwned/i.test(error.message);
-        if (weakPassword) {
-          toast.error("Password too weak", {
-            description: "Use 12+ characters with uppercase, lowercase, numbers, and special characters.",
+      // Step 2: Sign in immediately to establish active authenticated session
+      let signedIn = false;
+      const { data: signInData, error: signInErr } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      });
+
+      if (!signInErr && signInData?.session) {
+        signedIn = true;
+      } else {
+        // Fallback: If client-side signInWithPassword failed, try fallback signup or retry
+        try {
+          const signUpRes = await supabase.auth.signUp({
+            email,
+            password,
+            options: { data: { full_name } },
           });
-          return;
-        }
-        toast.error("Registration failed", { description: error.message });
-        return;
-      }
-
-      // Step 4: Dispatch the official welcome email notification
-      try {
-        await sendWelcomeRegistrationEmail({ data: { email, fullName: full_name } });
-      } catch {
-        // non-blocking
-      }
-
-      let session = data.session;
-      if (!session) {
-        const signInRes = await supabase.auth.signInWithPassword({ email, password });
-        if (signInRes.data?.session) {
-          session = signInRes.data.session;
+          if (signUpRes.data?.session) {
+            signedIn = true;
+          } else {
+            const retryRes = await supabase.auth.signInWithPassword({ email, password });
+            if (retryRes.data?.session) {
+              signedIn = true;
+            }
+          }
+        } catch {
+          // ignore fallback error
         }
       }
 
       toast.success("Account created successfully! 🎉", {
-        description: `Welcome to Sentinel Security, ${full_name}!`,
+        description: `Welcome to Sentinel Security, ${full_name}! Opening your dashboard...`,
       });
 
       setPendingRegisterData(null);
 
-      if (session) {
-        await continueAfterPassword();
-        return;
-      }
-
-      setPendingEmail(email);
-      setResendIn(60);
+      // Step 3: Record security login event and navigate directly to the user dashboard
+      await continueAfterPassword();
     } catch (err: any) {
       toast.error("Verification failed", {
         description: err?.message || "Invalid or expired verification code.",
@@ -377,16 +359,6 @@ function AuthPage() {
     } finally {
       setBusy(false);
     }
-  }
-
-  async function resendConfirmation() {
-    if (!pendingEmail || resendIn > 0) return;
-    setBusy(true);
-    const { error } = await supabase.auth.resend({ type: "signup", email: pendingEmail });
-    setBusy(false);
-    setResendIn(60);
-    if (error) toast.error("Could not resend", { description: error.message });
-    else toast.success("Confirmation email sent again");
   }
 
   async function handleForgot(e?: React.FormEvent<HTMLFormElement>) {
@@ -751,7 +723,7 @@ function AuthPage() {
             />
           </div>
           <Button type="submit" className="w-full" disabled={busy || registerOtpInput.length !== 6}>
-            {busy ? "Verifying & Creating Account…" : "Verify & Create Account"}
+            {busy ? "Verifying & Opening Dashboard…" : "Verify & Open Dashboard"}
           </Button>
           <Button
             type="button"
@@ -834,35 +806,6 @@ function AuthPage() {
             Back to sign in
           </Button>
         </form>
-      </Screen>
-    );
-  }
-
-  if (pendingEmail) {
-    return (
-      <Screen>
-        <div className="space-y-4 text-center">
-          <h1 className="text-xl font-semibold">Account created — confirm your email</h1>
-          <p className="text-sm text-muted-foreground">
-            We sent a confirmation link to{" "}
-            <span className="font-medium text-foreground">{pendingEmail}</span>. Open it to activate
-            the account. Sign-in stays blocked until the address is confirmed.
-          </p>
-          <p className="text-xs text-muted-foreground">
-            Nothing in your inbox? Check spam or promotions.
-          </p>
-          <Button
-            variant="outline"
-            className="w-full"
-            onClick={resendConfirmation}
-            disabled={busy || resendIn > 0}
-          >
-            {resendIn > 0 ? `Resend available in ${resendIn}s` : "Resend confirmation email"}
-          </Button>
-          <Button variant="ghost" className="w-full" onClick={() => setPendingEmail(null)}>
-            Back to sign in
-          </Button>
-        </div>
       </Screen>
     );
   }
